@@ -11,7 +11,7 @@ export default {
     const rawBody = await request.text();
 
     // 3. Verify the OpenAI webhook signature (Svix scheme: id.timestamp.body)
-   if (env.OPENAI_WEBHOOK_SECRET) {
+    if (env.OPENAI_WEBHOOK_SECRET) {
       const isValid = await verifySignature(
         env.OPENAI_WEBHOOK_SECRET,
         request.headers,
@@ -22,7 +22,6 @@ export default {
         return new Response("Unauthorized", { status: 401 });
       }
     } else {
-      // No secret configured — skip verification (only recommended for testing)
       console.warn("Webhook signature verification skipped: no secret configured");
     }
 
@@ -34,8 +33,7 @@ export default {
       return new Response("Invalid JSON", { status: 400 });
     }
 
-    // 5. Return 200 immediately so OpenAI knows we received it.
-    //    The notification is sent in the background (does not block the response).
+    // 5. Return 200 immediately; send the notification in the background
     ctx.waitUntil(handleEvent(event, env));
 
     return new Response(JSON.stringify({ received: true }), {
@@ -43,19 +41,18 @@ export default {
       headers: { "Content-Type": "application/json" },
     });
   },
+};
 
 // ========== Signature Verification ==========
 
 async function verifySignature(secret, headers, rawBody) {
-  // OpenAI sends webhook-id / webhook-timestamp / webhook-signature
-  // (some setups expose them as svix-id / svix-timestamp / svix-signature)
   const id = headers.get("webhook-id") || headers.get("svix-id");
   const timestamp = headers.get("webhook-timestamp") || headers.get("svix-timestamp");
   const signatureHeader = headers.get("webhook-signature") || headers.get("svix-signature");
 
   if (!id || !timestamp || !signatureHeader) return false;
 
-  // Optional but recommended: reject stale timestamps (> 5 minutes)
+  // Reject stale timestamps (> 5 minutes) to limit replay
   const now = Math.floor(Date.now() / 1000);
   if (Math.abs(now - parseInt(timestamp, 10)) > 300) return false;
 
@@ -73,12 +70,10 @@ async function verifySignature(secret, headers, rawBody) {
     ["verify"]
   );
 
-  // Signed content is id.timestamp.rawBody
   const signedContent = encoder.encode(`${id}.${timestamp}.${rawBody}`);
 
-  // The header may contain multiple space-separated signatures, each like "v1,<base64>"
-  const candidates = signatureHeader.trim().split(/\s+/);
-  for (const candidate of candidates) {
+  // Header may contain multiple space-separated "v1,<base64>" signatures
+  for (const candidate of signatureHeader.trim().split(/\s+/)) {
     const parts = candidate.split(",");
     const version = parts.length === 2 ? parts[0] : "v1";
     const signature = parts.length === 2 ? parts[1] : parts[0];
@@ -110,38 +105,35 @@ function base64ToBytes(b64) {
 async function handleEvent(event, env) {
   const eventType = event.type ?? "unknown";
   const batchData = event.data ?? {};
-  const status = eventType.replace("batch.", ""); // completed / failed / canceled / expired
+  const status = eventType.replace("batch.", "");
 
-  // Skip statuses we don't care about
   const validStatuses = new Set(["completed", "failed", "canceled", "expired"]);
   if (!validStatuses.has(status)) return;
 
   const notification = buildNotification(status, batchData);
 
-  // Send to ntfy (via the JSON publish protocol, all fields in the body)
-  if (env.NTFY_TOPIC) {
-    try {
-      await fetch("https://ntfy.sh", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          topic: env.NTFY_TOPIC,
-          title: notification.title,
-          message: notification.message,
-          priority: notification.priority,
-          tags: notification.tags,
-          click: notification.clickUrl || undefined,
-        }),
-      });
-    } catch (err) {
-      console.error("Failed to send ntfy notification:", err);
-      // Notification failure should not affect the response already sent to OpenAI
-    }
-  } else {
+  if (!env.NTFY_TOPIC) {
     console.warn("NTFY_TOPIC not configured; notification skipped");
+    return;
+  }
+
+  try {
+    await fetch("https://ntfy.sh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        topic: env.NTFY_TOPIC,
+        title: notification.title,
+        message: notification.message,
+        priority: notification.priority,
+        tags: notification.tags,
+        click: notification.clickUrl || undefined,
+      }),
+    });
+  } catch (err) {
+    console.error("Failed to send ntfy notification:", err);
   }
 }
-
 
 function buildNotification(status, data) {
   const statusEmoji = {
@@ -153,7 +145,6 @@ function buildNotification(status, data) {
 
   const priority = status === "failed" ? "high" : "default";
 
-  // Extract metadata
   const batchId = data.id ?? "Unknown ID";
   const counts = data.request_counts ?? {};
   const total = counts.total ?? 0;
@@ -168,7 +159,6 @@ function buildNotification(status, data) {
     data.completed_at || data.failed_at || data.expired_at || null
   );
 
-  // Build the message body
   const lines = [
     `${statusEmoji} OpenAI Batch ${status.toUpperCase()}`,
     `ID: ${batchId}`,
@@ -184,12 +174,10 @@ function buildNotification(status, data) {
   if (outputFileId) lines.push(`Output File: ${outputFileId}`);
   if (errorFileId) lines.push(`Error File: ${errorFileId}`);
 
-  // Click action: if an output file exists, tapping the notification jumps to the download URL
   const clickUrl = outputFileId
     ? `https://api.openai.com/v1/files/${outputFileId}/content`
     : null;
 
-  // ntfy tags (used for icons/categorization)
   const tags = ["openai", "robot_face"];
   if (status === "completed") tags.push("white_check_mark");
   if (status === "failed") tags.push("x");
