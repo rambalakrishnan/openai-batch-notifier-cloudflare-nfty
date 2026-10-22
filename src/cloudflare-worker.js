@@ -9,22 +9,18 @@ export default {
 
     // 2. Read the raw request body (signature verification must use the raw bytes)
     const rawBody = await request.text();
-    const signatureHeader = request.headers.get("webhook-signature");
 
-    // 3. Verify the OpenAI webhook signature
-    if (env.OPENAI_WEBHOOK_SECRET && signatureHeader) {
+    // 3. Verify the OpenAI webhook signature (Svix scheme: id.timestamp.body)
+   if (env.OPENAI_WEBHOOK_SECRET) {
       const isValid = await verifySignature(
         env.OPENAI_WEBHOOK_SECRET,
-        signatureHeader,
+        request.headers,
         rawBody
       );
       if (!isValid) {
         console.error("Invalid webhook signature");
         return new Response("Unauthorized", { status: 401 });
       }
-    } else if (env.OPENAI_WEBHOOK_SECRET && !signatureHeader) {
-      // Secret is configured but the request has no signature header — reject
-      return new Response("Missing signature", { status: 401 });
     } else {
       // No secret configured — skip verification (only recommended for testing)
       console.warn("Webhook signature verification skipped: no secret configured");
@@ -47,54 +43,67 @@ export default {
       headers: { "Content-Type": "application/json" },
     });
   },
-};
-
 
 // ========== Signature Verification ==========
 
-async function verifySignature(secret, signatureHeader, rawBody) {
+async function verifySignature(secret, headers, rawBody) {
+  // OpenAI sends webhook-id / webhook-timestamp / webhook-signature
+  // (some setups expose them as svix-id / svix-timestamp / svix-signature)
+  const id = headers.get("webhook-id") || headers.get("svix-id");
+  const timestamp = headers.get("webhook-timestamp") || headers.get("svix-timestamp");
+  const signatureHeader = headers.get("webhook-signature") || headers.get("svix-signature");
+
+  if (!id || !timestamp || !signatureHeader) return false;
+
+  // Optional but recommended: reject stale timestamps (> 5 minutes)
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - parseInt(timestamp, 10)) > 300) return false;
+
+  // Strip the whsec_ prefix and base64-decode the remainder
+  const secretKey = secret.startsWith("whsec_") ? secret.slice(6) : secret;
+  const keyBytes = base64ToBytes(secretKey);
+  if (!keyBytes) return false;
+
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+
+  // Signed content is id.timestamp.rawBody
+  const signedContent = encoder.encode(`${id}.${timestamp}.${rawBody}`);
+
+  // The header may contain multiple space-separated signatures, each like "v1,<base64>"
+  const candidates = signatureHeader.trim().split(/\s+/);
+  for (const candidate of candidates) {
+    const parts = candidate.split(",");
+    const version = parts.length === 2 ? parts[0] : "v1";
+    const signature = parts.length === 2 ? parts[1] : parts[0];
+    if (version !== "v1") continue;
+
+    const sigBytes = base64ToBytes(signature);
+    if (!sigBytes) continue;
+
+    const valid = await crypto.subtle.verify("HMAC", key, sigBytes, signedContent);
+    if (valid) return true;
+  }
+
+  return false;
+}
+
+function base64ToBytes(b64) {
   try {
-    // OpenAI's signature is usually "sha256=<hex>" or a bare hex string
-    const providedSignature = signatureHeader.startsWith("sha256=")
-      ? signatureHeader.slice(7)
-      : signatureHeader;
-
-    const encoder = new TextEncoder();
-    const key = await crypto.subtle.importKey(
-      "raw",
-      encoder.encode(secret),
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["verify"]
-    );
-
-    // Decode the hex signature into a byte array
-    const signatureBytes = hexToBytes(providedSignature);
-    if (!signatureBytes) return false;
-
-    // crypto.subtle.verify uses constant-time comparison internally,
-    // which protects against timing attacks
-    return await crypto.subtle.verify(
-      "HMAC",
-      key,
-      signatureBytes,
-      encoder.encode(rawBody)
-    );
-  } catch (err) {
-    console.error("Signature verification error:", err);
-    return false;
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  } catch {
+    return null;
   }
 }
-
-function hexToBytes(hex) {
-  if (!/^[0-9a-f]+$/i.test(hex) || hex.length % 2 !== 0) return null;
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return bytes;
-}
-
 
 // ========== Event Handling and Notification ==========
 
