@@ -3,6 +3,6 @@
   "main": "src/cloudflare-worker.js",
   "compatibility_date": "2026-10-01"
   "secrets": {
-      "required": [""OPENAI_WEBHOOK_SECRET", "NTFY_TOPIC"]
+      "required": ["OPENAI_WEBHOOK_SECRET", "NTFY_TOPIC"]
   {
 }
